@@ -1,4 +1,3 @@
-# xuece
 import math
 import struct
 import inspect
@@ -11,6 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 
 @dataclass
+# 定义了模型的各种超参数,如embedding维度、层数、头数等。这些参数会在实例化模型时传入
 class ModelArgs:
     dim: int = 4096
     n_layers: int = 32
@@ -22,7 +22,7 @@ class ModelArgs:
     max_seq_len: int = 2048
     dropout: float = 0.0
 
-
+# 实现了RMSNorm层,用于层内归一化
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float):
         super().__init__()
@@ -36,7 +36,7 @@ class RMSNorm(torch.nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-
+# precompute_freqs_cis: 预计算了相对位置编码所需的正余弦项,这是Rotary Embedding的实现
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
@@ -52,6 +52,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(shape)
 
+# apply_rotary_emb: 将Rotary Embedding应用到query和key张量上
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -79,6 +80,7 @@ def apply_rotary_emb(
 
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
+# repeat_kv: 重复key和value,用于多头注意力中的grouped multi-head attention(GQA)
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
@@ -90,6 +92,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
+# 实现了Transformer的多头自注意力机制,内部调用上述的 Rotary Embedding
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -114,7 +117,7 @@ class Attention(nn.Module):
             mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
             mask = torch.triu(mask, diagonal=1)
             self.register_buffer("mask", mask)
-
+    # forward函数接收输入x,以及预计算的相对位置编码正弦余弦项
     def forward(
         self,
         x: torch.Tensor,
@@ -123,45 +126,48 @@ class Attention(nn.Module):
     ):
         bsz, seqlen, _ = x.shape
 
-        # QKV
+        # QKV 对输入x进行线性变换,得到Query/Key/Value矩阵,并reshape到多个头上
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        # RoPE relative positional embeddings
+        # 将相对位置编码应用到Query和Key上,这通过调用apply_rotary_emb实现
         xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
 
-        # grouped multiquery attention: expand out keys and values
+        # 对Key和Value进行扩展重复,实现分组多头注意力(grouped multi-head attention)
         xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
-        # make heads into a batch dimension
+        # 将Q/K/V转置,以头的维度作为batch dimension
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
-        # flash implementation
+        # 如果支持调用PyTorch内置的scaled dot-product attention,则直接调用;否则手动实现:
         if self.flash:
             output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
-            # manual implementation
+            # 计算分数矩阵scores
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             assert hasattr(self, 'mask')
+            # 加上遮挡Mask
             scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            # softmax归一化到概率
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
+            # 与V矩阵相乘
             output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
 
-        # restore time as batch dimension and concat heads
+        # 将头维恢复为序列维,得到输出
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
-        # final projection into the residual stream
+        # 最后一个线性层wo投影到模型的隐状态维度
         output = self.wo(output)
-        output = self.resid_dropout(output)
+        output = self.resid_dropout(output) # 残差
         return output
 
-
+# Transformer的前馈全连接层
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
         super().__init__()
@@ -175,7 +181,7 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
-
+# TransformerBlock: 将Attention和FeedForward组合成一个Transformer的block
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
@@ -192,13 +198,13 @@ class TransformerBlock(nn.Module):
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
-
+    # 1. 接收输入x,相对位置编码频率项freqs
     def forward(self, x, freqs_cos, freqs_sin):
         h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
-
+# Transformer模型类,包含多个TransformerBlock,以及前后的归一化和词嵌入、输出变换等层
 class Transformer(nn.Module):
     last_loss: Optional[torch.Tensor]
 
@@ -210,10 +216,11 @@ class Transformer(nn.Module):
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
+        # 创建多层TransformerBlock并存入nn.ModuleList
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)    # 定义一些预计算的相对位置编码
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         # share the unembedding parameters with the embedding parameters
@@ -249,7 +256,7 @@ class Transformer(nn.Module):
         freqs_cos = self.freqs_cos[:seqlen]
         freqs_sin = self.freqs_sin[:seqlen]
 
-        for layer in self.layers:
+        for layer in self.layers:   # 循环调用TransformerBlock层
             h = layer(h, freqs_cos, freqs_sin)
         h = self.norm(h)
 
@@ -263,7 +270,7 @@ class Transformer(nn.Module):
             self.last_loss = None
 
         return logits
-
+    # 构造模型的优化器,区分权重衰减策略
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -317,7 +324,7 @@ class Transformer(nn.Module):
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
-            # forward the model to get the logits for the index in the sequence
+            # 调用forward函数获取logits,根据temperature采样生成下一个toke
             logits = self(idx_cond)
             logits = logits[:, -1, :] # crop to just the final time step
             if temperature == 0.0:
@@ -338,6 +345,7 @@ class Transformer(nn.Module):
 
         return idx
 
+    # 将模型的参数导出为二进制文件
     def export(self, filepath='model.bin'):
         """export the model weights in fp32 into .bin file to be read from C"""
         f = open(filepath, 'wb')
